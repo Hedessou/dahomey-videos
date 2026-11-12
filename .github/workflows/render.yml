@@ -55,6 +55,8 @@ jobs:
       - name: Rendre la vidéo
         env:
           POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
         run: python render.py payload.json out
 
       - name: Garder une copie (artefact)

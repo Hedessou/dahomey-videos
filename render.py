@@ -41,11 +41,14 @@ COMIC_STYLE = os.environ.get(
     "COMIC_STYLE",
     "franco-belgian comic book panel, ligne claire style, bold clean ink outlines, "
     "flat vivid colors, detailed background, cinematic framing, "
-    "Kingdom of Dahomey West Africa 17th-19th century, Fon people, "
-    "historically inspired clothing, architecture and objects, dignified and respectful, "
-    "no text, no letters, no speech bubbles, no watermark",
+    "Kingdom of Dahomey, West Africa, 17th-19th century, Black African Fon people, "
+    "red laterite earth, mud-brick palaces with thatched roofs, palm trees, savanna, "
+    "traditional West African cloth, cowries, parasols, no European buildings or clothing, "
+    "dignified and respectful, no text, no letters, no speech bubbles, no watermark",
 )
 POLLI_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
+CF_ACCOUNT = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 FONT_DIR = Path(__file__).parent / "fonts"
 
 # mise en page
@@ -171,11 +174,23 @@ def tts(text, mp3_path):
 
 
 def align_punctuation(words, text):
+    """Affiche les mots du texte original (avec ponctuation) sur les timings de la voix."""
     toks = text.split()
+    if not words or not toks:
+        return words
     if len(toks) == len(words):
         for w, t in zip(words, toks):
             w[0] = t
-    return words
+        return words
+    nb, nt = len(words), len(toks)
+    out = []
+    for i, t in enumerate(toks):
+        j = min(nb - 1, (i * nb) // nt)
+        out.append([t, words[j][1], words[j][2]])
+    for i in range(len(out) - 1):
+        out[i][2] = max(out[i][1] + 0.05, out[i + 1][1])
+    out[-1][2] = max(out[-1][2], words[-1][2])
+    return out
 
 
 # ---------------------------------------------------------------- images
@@ -232,13 +247,38 @@ def wikimedia_file(queries, path, skip=()):
 _last_polli = [0.0]
 
 
+def cloudflare_image(full, path, seed):
+    """FLUX-1-schnell sur Cloudflare Workers AI (gratuit : 10 000 neurons/jour, sans filigrane)."""
+    import base64
+    url = (f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}"
+           "/ai/run/@cf/black-forest-labs/flux-1-schnell")
+    for attempt in range(3):
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {CF_TOKEN}"},
+                              json={"prompt": full[:2000], "steps": 6, "seed": seed}, timeout=120)
+            data = r.json()
+            img = ((data.get("result") or {}).get("image")) if r.ok else None
+            if img:
+                path.write_bytes(base64.b64decode(img))
+                return path
+            log(f"cloudflare essai {attempt+1} :", r.status_code, str(data.get("errors"))[:200])
+        except Exception as e:
+            log(f"cloudflare essai {attempt+1} :", str(e)[:200])
+        time.sleep(5 * (attempt + 1))
+    return None
+
+
 def comic_image(prompt, path, seed):
-    """Case de BD générée par Pollinations (gratuit ; ~1 requête / 15 s en anonyme)."""
+    """Case de BD : Cloudflare si configuré, sinon Pollinations (anonyme : filigrane possible)."""
     full = f"{prompt}. {COMIC_STYLE}"
+    if CF_ACCOUNT and CF_TOKEN:
+        got = cloudflare_image(full, path, seed)
+        if got:
+            return got
     url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(full, safe="")
            + f"?width=1024&height=1280&model=flux&nologo=true&seed={seed}")
     headers = {"Authorization": f"Bearer {POLLI_TOKEN}"} if POLLI_TOKEN else {}
-    for attempt in range(4):
+    for attempt in range(2 if not POLLI_TOKEN else 4):
         wait = 16 - (time.time() - _last_polli[0])
         if wait > 0:
             time.sleep(wait)
