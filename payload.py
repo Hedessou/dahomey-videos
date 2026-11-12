@@ -37,6 +37,6 @@ elif manual.strip():
 else:
     ep = json.loads(Path("exemples/episode.json").read_text(encoding="utf-8"))
 
-if not ep.get("script"):
+if not ep.get("script") and not ep.get("scenes"):
     sys.exit("Payload sans script : rien à rendre.")
 json.dump(ep, sys.stdout, ensure_ascii=False, indent=2)

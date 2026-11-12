@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-Rendu d'un épisode « Histoire du Dahomey » en vidéo verticale 1080x1920.
+Rendu d'un épisode « Histoire du Dahomey » : vidéo verticale 1080x1920 d'environ 1 min 30.
 
-Entrée : un fichier JSON (voir exemples/episode.json) avec au minimum
-    title, script (3 blocs séparés par |||), image_query
-Sortie (dans le dossier donné) :
-    video.mp4, cover.jpg, description.txt, meta.json
+Structure :
+  scène 1  : photo des Palais royaux d'Abomey (Wikimedia Commons)
+  scènes 2+: planches de bande dessinée générées pour illustrer ce que dit la narration
+Chaque scène = une case de BD encadrée + un « récitatif » (encadré jaune) synchronisé à la voix.
 
-Gratuit : voix Microsoft Edge (edge-tts), images Wikimedia Commons, ffmpeg.
+Entrée : JSON (voir exemples/episode.json) avec title + scenes[{narration, image_prompt}]
+         (ancien format accepté : script "bloc|||bloc|||bloc").
+Sortie : video.mp4, cover.jpg, description.txt, meta.json
+
+Gratuit : voix Microsoft Edge (edge-tts), images Wikimedia + Pollinations, ffmpeg.
 """
 import asyncio
 import json
@@ -18,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 import requests
@@ -25,13 +30,29 @@ import requests
 W, H, FPS = 1080, 1920, 30
 VOICE = os.environ.get("VOICE", "fr-FR-DeniseNeural")
 RATE = os.environ.get("VOICE_RATE", "-4%")
-UA = "DahomeyHistoryBot/1.0 (https://github.com; video rendering of public-domain history images)"
-FALLBACK_QUERIES = ["Royal Palaces of Abomey", "Kingdom of Dahomey", "Abomey bas-relief", "Ouidah"]
+UA = "DahomeyHistoryBot/1.0 (educational history videos; contact via GitHub)"
+PALACE_QUERIES = ["Royal Palaces of Abomey", "Abomey palace", "Palais royaux d'Abomey"]
+FALLBACK_QUERIES = ["Abomey bas-relief", "Kingdom of Dahomey", "Ouidah"]
 SERIES_LABEL = os.environ.get("SERIES_LABEL", "HISTOIRE DU DAHOMEY")
 HASHTAGS = os.environ.get(
-    "HASHTAGS", "#Bénin #Dahomey #HistoireAfricaine #Abomey #Histoire #Afrique"
+    "HASHTAGS", "#Bénin #Dahomey #HistoireAfricaine #Abomey #Histoire #Afrique #BD"
 )
+COMIC_STYLE = os.environ.get(
+    "COMIC_STYLE",
+    "franco-belgian comic book panel, ligne claire style, bold clean ink outlines, "
+    "flat vivid colors, detailed background, cinematic framing, "
+    "Kingdom of Dahomey West Africa 17th-19th century, Fon people, "
+    "historically inspired clothing, architecture and objects, dignified and respectful, "
+    "no text, no letters, no speech bubbles, no watermark",
+)
+POLLI_TOKEN = os.environ.get("POLLINATIONS_TOKEN", "")
 FONT_DIR = Path(__file__).parent / "fonts"
+
+# mise en page
+PANEL_W, PANEL_H = 960, 1180          # case de BD (≈ 4:5)
+PANEL_X, PANEL_Y = (W - PANEL_W) // 2, 230
+BORDER = 10
+PAPER = "0xF1E4C3"                    # papier crème
 
 
 def log(*a):
@@ -53,36 +74,48 @@ def probe_duration(path):
 
 
 # ---------------------------------------------------------------- texte
-def split_blocks(script: str):
-    """Toujours 3 blocs, même si l'IA n'a pas respecté le séparateur |||."""
-    script = (script or "").strip()
-    parts = [p.strip() for p in script.split("|||") if p.strip()]
-    if len(parts) == 3:
-        return parts
-    text = " ".join(parts) if parts else script
-    sentences = re.split(r"(?<=[.!?…])\s+", text)
-    sentences = [s for s in sentences if s]
-    if len(sentences) < 3:
+def split_text(text, n):
+    """Découpe un texte en n morceaux à peu près égaux, sur des fins de phrase."""
+    sentences = [s for s in re.split(r"(?<=[.!?…])\s+", text.strip()) if s]
+    if len(sentences) < n:
         words = text.split()
-        n = max(1, math.ceil(len(words) / 3))
-        out = [" ".join(words[i:i + n]) for i in range(0, len(words), n)][:3]
-        return out + ["…"] * (3 - len(out))
+        k = max(1, math.ceil(len(words) / n))
+        parts = [" ".join(words[i:i + k]) for i in range(0, len(words), k)]
+        return (parts + ["…"] * n)[:n]
     total = sum(len(s) for s in sentences)
-    blocks, cur, acc = [], [], 0
+    parts, cur, acc = [], [], 0
     for s in sentences:
         cur.append(s)
         acc += len(s)
-        if len(blocks) < 2 and acc >= total * (len(blocks) + 1) / 3:
-            blocks.append(" ".join(cur))
+        if len(parts) < n - 1 and acc >= total * (len(parts) + 1) / n:
+            parts.append(" ".join(cur))
             cur = []
-    blocks.append(" ".join(cur))
-    blocks = [b for b in blocks if b.strip()]
-    while len(blocks) < 3:  # cas extrêmes
-        longest = max(range(len(blocks)), key=lambda i: len(blocks[i]))
-        w = blocks[longest].split()
-        half = len(w) // 2
-        blocks[longest:longest + 1] = [" ".join(w[:half]), " ".join(w[half:])]
-    return blocks[:3]
+    parts.append(" ".join(cur))
+    parts = [p for p in parts if p.strip()]
+    return (parts + ["…"] * n)[:n]
+
+
+def get_scenes(ep):
+    """Retourne [(narration, image_prompt)]. Accepte le nouveau et l'ancien format."""
+    scenes = ep.get("scenes")
+    if isinstance(scenes, str):
+        try:
+            scenes = json.loads(scenes)
+        except json.JSONDecodeError:
+            scenes = None
+    out = []
+    if isinstance(scenes, list):
+        for s in scenes:
+            if isinstance(s, dict):
+                txt = (s.get("narration") or s.get("text") or "").strip()
+                if txt:
+                    out.append((txt, (s.get("image_prompt") or s.get("image") or "").strip()))
+    if len(out) >= 2:
+        return out
+    script = (ep.get("script") or "").replace("|||", " ").strip()
+    if not script:
+        raise SystemExit("Aucune narration dans l'épisode.")
+    return [(t, "") for t in split_text(script, 6)]
 
 
 # ---------------------------------------------------------------- voix
@@ -90,7 +123,7 @@ async def _edge_tts(text, mp3_path):
     import edge_tts
     try:
         com = edge_tts.Communicate(text, VOICE, rate=RATE, boundary="WordBoundary")
-    except TypeError:  # anciennes versions
+    except TypeError:
         com = edge_tts.Communicate(text, VOICE, rate=RATE)
     words = []
     with open(mp3_path, "wb") as f:
@@ -104,7 +137,6 @@ async def _edge_tts(text, mp3_path):
 
 
 def estimate_words(text, duration):
-    """Timings approximatifs (repli quand la voix ne donne pas les mots)."""
     toks = text.split()
     total = sum(len(t) + 1 for t in toks) or 1
     t, out = 0.15, []
@@ -117,7 +149,6 @@ def estimate_words(text, duration):
 
 
 def tts(text, mp3_path):
-    """Retourne la liste [mot, début, fin]. edge-tts, sinon gTTS, sinon voix test."""
     if os.environ.get("FAKE_TTS"):
         dur = max(3.0, len(text) / 15.0)
         run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=220:duration={dur}",
@@ -128,10 +159,8 @@ def tts(text, mp3_path):
         try:
             words = asyncio.run(_edge_tts(text, mp3_path))
             if Path(mp3_path).stat().st_size > 1000:
-                if not words:
-                    words = estimate_words(text, probe_duration(mp3_path))
-                return words
-        except Exception as e:  # réseau, quota…
+                return words or estimate_words(text, probe_duration(mp3_path))
+        except Exception as e:
             last = e
             log("edge-tts échec", attempt + 1, e)
             time.sleep(3 * (attempt + 1))
@@ -142,7 +171,6 @@ def tts(text, mp3_path):
 
 
 def align_punctuation(words, text):
-    """Remet la ponctuation du texte original sur les mots d'edge-tts."""
     toks = text.split()
     if len(toks) == len(words):
         for w, t in zip(words, toks):
@@ -172,42 +200,82 @@ def wikimedia_images(query, n=3):
         info = (p.get("imageinfo") or [{}])[0]
         if info.get("mime") not in ("image/jpeg", "image/png"):
             continue
-        if min(info.get("width", 0), info.get("height", 0)) < 400:
+        if min(info.get("width", 0), info.get("height", 0)) < 500:
             continue
         found.append(info.get("thumburl") or info.get("url"))
     return found[:n]
 
 
-def download(url, path):
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+def download(url, path, timeout=60, headers=None):
+    h = {"User-Agent": UA}
+    h.update(headers or {})
+    r = requests.get(url, headers=h, timeout=timeout)
     r.raise_for_status()
+    if not r.headers.get("content-type", "").startswith("image") or len(r.content) < 5000:
+        raise ValueError(f"pas une image ({r.headers.get('content-type')}, {len(r.content)} o)")
     path.write_bytes(r.content)
     return path
 
 
-def collect_images(queries, work, n=3):
-    urls = []
+def wikimedia_file(queries, path, skip=()):
     for q in queries:
-        if not q:
-            continue
-        for u in wikimedia_images(q, n):
-            if u not in urls:
-                urls.append(u)
-        if len(urls) >= n:
-            break
-    files = []
-    for i, u in enumerate(urls[:n]):
+        for u in wikimedia_images(q, 6):
+            if u in skip:
+                continue
+            try:
+                return download(u, path), u
+            except Exception as e:
+                log("wikimedia raté", e)
+    return None, None
+
+
+_last_polli = [0.0]
+
+
+def comic_image(prompt, path, seed):
+    """Case de BD générée par Pollinations (gratuit ; ~1 requête / 15 s en anonyme)."""
+    full = f"{prompt}. {COMIC_STYLE}"
+    url = ("https://image.pollinations.ai/prompt/" + urllib.parse.quote(full, safe="")
+           + f"?width=1024&height=1280&model=flux&nologo=true&seed={seed}")
+    headers = {"Authorization": f"Bearer {POLLI_TOKEN}"} if POLLI_TOKEN else {}
+    for attempt in range(4):
+        wait = 16 - (time.time() - _last_polli[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_polli[0] = time.time()
         try:
-            files.append(download(u, work / f"img{i}{Path(u.split('?')[0]).suffix or '.jpg'}"))
+            return download(url, path, timeout=150, headers=headers)
         except Exception as e:
-            log("téléchargement raté", u, e)
-    while len(files) < n:  # fond de secours : dégradé ocre/terre
-        p = work / f"fallback{len(files)}.png"
-        run(["ffmpeg", "-y", "-f", "lavfi", "-i",
-             f"gradients=s={W}x{H}:c0=0x3b1f0e:c1=0x8a4b1c:x0=0:y0=0:x1={W}:y1={H}:d=1",
-             "-frames:v", "1", str(p)])
-        files.append(p)
-    return files, urls[:n]
+            log(f"pollinations essai {attempt+1} :", str(e)[:160])
+            time.sleep(10 * (attempt + 1))
+    return None
+
+
+def paper_background(path):
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c={PAPER}:s={W}x{H}:d=1",
+         "-vf", "noise=alls=7:allf=u,vignette=PI/5", "-frames:v", "1", str(path)])
+    return path
+
+
+def make_panel_still(img, bg, out):
+    """Case de BD : image recadrée 4:5, bord noir épais, ombre portée, sur papier."""
+    pw, ph = PANEL_W - 2 * BORDER, PANEL_H - 2 * BORDER
+    fc = (
+        f"[1:v]scale={pw}:{ph}:force_original_aspect_ratio=increase,crop={pw}:{ph},"
+        f"pad={PANEL_W}:{PANEL_H}:{BORDER}:{BORDER}:black[p];"
+        f"[0:v]drawbox=x={PANEL_X+14}:y={PANEL_Y+16}:w={PANEL_W}:h={PANEL_H}:"
+        f"color=black@0.35:t=fill[b];"
+        f"[b][p]overlay={PANEL_X}:{PANEL_Y},format=yuv420p"
+    )
+    run(["ffmpeg", "-y", "-i", str(bg), "-i", str(img), "-filter_complex", fc,
+         "-frames:v", "1", "-q:v", "2", str(out)])
+
+
+def placeholder(path, text_color="0x8a4b1c"):
+    run(["ffmpeg", "-y", "-f", "lavfi", "-i",
+         f"gradients=s=1024x1280:c0=0x3b1f0e:c1={text_color}:x0=0:y0=0:x1=1024:y1=1280:d=1",
+         "-frames:v", "1", str(path)])
+    return path
 
 
 # ---------------------------------------------------------------- sous-titres
@@ -236,14 +304,11 @@ def wrap(text, width):
 
 
 def build_ass(path, words, title, label, teaser, total, title_font, body_font):
-    """Sous-titres façon TikTok (3-5 mots), titre au début, teaser à la fin."""
     events = []
-    # légende par groupes de mots
-    chunk = []
-    groups = []
+    groups, chunk = [], []
     for w in words:
         chunk.append(w)
-        if len(chunk) >= 5 or re.search(r"[.,;:!?…]$", w[0]):
+        if len(chunk) >= 6 or re.search(r"[.,;:!?…]$", w[0]):
             groups.append(chunk)
             chunk = []
     if chunk:
@@ -253,18 +318,16 @@ def build_ass(path, words, title, label, teaser, total, title_font, body_font):
         end = groups[i + 1][0][1] if i + 1 < len(groups) else g[-1][2] + 0.3
         end = min(end, g[-1][2] + 0.6)
         txt = " ".join(x[0] for x in g)
-        events.append(f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Caption,,0,0,0,,"
-                      + wrap(ass_escape(txt), 22))
-    # bandeau série tout le long
+        events.append(f"Dialogue: 1,{ass_time(start)},{ass_time(end)},Recit,,0,0,0,,"
+                      + wrap(ass_escape(txt), 28))
     events.append(f"Dialogue: 0,{ass_time(0)},{ass_time(total)},Label,,0,0,0,,{ass_escape(label)}")
-    # titre les 5 premières secondes
-    events.append(f"Dialogue: 2,{ass_time(0.2)},{ass_time(min(5.5, total))},Title,,0,0,0,,"
-                  r"{\fad(300,400)}" + wrap(ass_escape(title.upper()), 18))
-    # teaser à la fin
+    events.append(f"Dialogue: 2,{ass_time(0.2)},{ass_time(min(6, total))},Title,,0,0,0,,"
+                  r"{\fad(300,400)}" + wrap(ass_escape(title.upper()), 20))
     if teaser:
-        events.append(f"Dialogue: 2,{ass_time(max(0, total - 6))},{ass_time(total)},Teaser,,0,0,0,,"
-                      r"{\fad(400,0)}" + wrap(ass_escape("DEMAIN : " + teaser), 26))
+        events.append(f"Dialogue: 2,{ass_time(max(0, total - 7))},{ass_time(total)},Teaser,,0,0,0,,"
+                      r"{\fad(400,0)}" + wrap(ass_escape("DEMAIN : " + teaser), 24))
 
+    # couleurs ASS : &HAABBGGRR
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {W}
@@ -274,10 +337,10 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Caption,{body_font},64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H64000000,1,0,0,0,100,100,0,0,1,5,2,2,70,70,560,1
-Style: Title,{title_font},92,&H0000C8FF,&H00FFFFFF,&H00000000,&H96000000,1,0,0,0,100,100,1,0,1,6,3,8,60,60,260,1
-Style: Label,{body_font},38,&H00E6F0FF,&H00FFFFFF,&H00000000,&H78000000,1,0,0,0,100,100,4,0,3,10,0,8,60,60,130,1
-Style: Teaser,{title_font},66,&H00FFFFFF,&H00FFFFFF,&H00000000,&HB4103A6B,1,0,0,0,100,100,0,0,3,18,0,5,80,80,0,1
+Style: Recit,{body_font},54,&H00141414,&H00141414,&H0078E8FF,&H00000000,1,0,0,0,100,100,0,0,3,16,4,2,90,90,330,1
+Style: Title,{title_font},96,&H0000C8FF,&H00FFFFFF,&H00141414,&H96000000,1,0,0,0,100,100,1,0,1,7,4,8,60,60,300,1
+Style: Label,{body_font},36,&H00C3E4F1,&H00FFFFFF,&H00141414,&H00000000,1,0,0,0,100,100,4,0,3,12,0,8,60,60,120,1
+Style: Teaser,{title_font},70,&H00FFFFFF,&H00FFFFFF,&H00103A6B,&H00000000,1,0,0,0,100,100,0,0,3,20,0,5,80,80,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -286,40 +349,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
 
 def pick_fonts():
-    """Anton pour les titres si dispo (téléchargée par le workflow), sinon DejaVu."""
     title = "Anton" if (FONT_DIR / "Anton-Regular.ttf").exists() else "DejaVu Sans"
     return title, "DejaVu Sans"
 
 
 # ---------------------------------------------------------------- vidéo
 MOVES = [
-    # zoom avant centré
-    ("min(1+0.0009*on,1.18)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-    # zoom avant + glissement vers la droite
-    ("min(1.08+0.0005*on,1.18)", "(iw-iw/zoom)*on/{F}", "ih/2-(ih/zoom/2)"),
-    # dézoom
-    ("max(1.18-0.0009*on,1.0)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+    ("min(1+0.00045*on,1.07)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+    ("min(1.03+0.0003*on,1.08)", "(iw-iw/zoom)*on/{F}", "ih/2-(ih/zoom/2)"),
+    ("max(1.07-0.00045*on,1.0)", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+    ("min(1.03+0.0003*on,1.08)", "(iw-iw/zoom)*(1-on/{F})", "ih/2-(ih/zoom/2)"),
 ]
-
-
-def make_still(img, out):
-    """Image entière posée sur un fond flou de la même image (pas de tête coupée)."""
-    fc = (
-        f"[0:v]scale={W*2}:{H*2}:force_original_aspect_ratio=increase,crop={W*2}:{H*2},"
-        f"boxblur=40:2,eq=brightness=-0.18:saturation=0.8[bg];"
-        f"[0:v]scale={W*2-80}:{int(H*2*0.62)}:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2-120,vignette=PI/4,format=yuv420p"
-    )
-    run(["ffmpeg", "-y", "-i", str(img), "-filter_complex", fc,
-         "-frames:v", "1", "-q:v", "2", str(out)])
 
 
 def make_segment(still, audio, dur, idx, out):
     frames = int(math.ceil(dur * FPS))
     z, x, y = MOVES[idx % len(MOVES)]
     x = x.replace("{F}", str(frames))
-    vf = (f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},"
-          f"fade=t=in:st=0:d=0.35,fade=t=out:st={dur-0.35:.2f}:d=0.35,format=yuv420p")
+    vf = (f"scale={W*2}:{H*2},zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},"
+          f"fade=t=in:st=0:d=0.3,fade=t=out:st={dur-0.3:.2f}:d=0.3,format=yuv420p")
     run(["ffmpeg", "-y", "-loop", "1", "-framerate", str(FPS), "-i", str(still),
          "-i", str(audio), "-filter_complex",
          f"[0:v]{vf}[v];[1:a]aresample=44100,apad,atrim=0:{dur:.3f}[a]",
@@ -335,31 +383,58 @@ def main(payload_path, out_dir):
     work = Path(tempfile.mkdtemp(prefix="render_"))
 
     title = (ep.get("title") or "Histoire du Dahomey").strip()
-    blocks = split_blocks(ep.get("script", ""))
+    scenes = get_scenes(ep)
     episode = str(ep.get("episode") or ep.get("current_episode") or "").strip()
     label = f"{SERIES_LABEL} · ÉP. {episode}" if episode else SERIES_LABEL
     teaser = (ep.get("next_event") or "").strip()
-    log("épisode", episode, "—", title)
+    seed = int(re.sub(r"\D", "", episode) or 7) * 101 + 7
+    log(f"épisode {episode} — {title} — {len(scenes)} scènes")
 
-    images, image_urls = collect_images(
-        [ep.get("image_query"), ep.get("period"), *FALLBACK_QUERIES], work)
+    bg = paper_background(work / "paper.png")
+    used_urls, images_info = [], []
+
+    # images : scène 1 = palais d'Abomey (photo), puis cases de BD
+    stills = []
+    for i, (_, prompt) in enumerate(scenes):
+        img = None
+        if i == 0:
+            img, u = wikimedia_file(PALACE_QUERIES, work / "img0.jpg")
+            if u:
+                used_urls.append(u)
+                images_info.append({"scene": 1, "source": "wikimedia", "url": u})
+        else:
+            p = prompt or scenes[i][0][:300]
+            img = comic_image(p, work / f"img{i}.jpg", seed + i)
+            if img:
+                images_info.append({"scene": i + 1, "source": "pollinations", "prompt": p})
+            else:  # repli : photo d'archive
+                img, u = wikimedia_file([ep.get("image_query"), *FALLBACK_QUERIES],
+                                        work / f"img{i}.jpg", skip=used_urls)
+                if u:
+                    used_urls.append(u)
+                    images_info.append({"scene": i + 1, "source": "wikimedia", "url": u})
+        if not img:
+            img = placeholder(work / f"img{i}.png")
+        still = work / f"still{i}.jpg"
+        make_panel_still(img, bg, still)
+        stills.append(still)
+        log(f"image {i+1}/{len(scenes)} prête")
 
     all_words, segments, offset = [], [], 0.0
-    for i, text in enumerate(blocks):
+    for i, (text, _) in enumerate(scenes):
         mp3 = work / f"voice{i}.mp3"
         words = align_punctuation(tts(text, mp3), text)
-        dur = probe_duration(mp3) + (0.6 if i < 2 else 1.2)
-        if i == 2 and teaser:
-            dur = max(dur, 6.5)
-        still = work / f"still{i}.jpg"
-        make_still(images[i], still)
+        last = i == len(scenes) - 1
+        dur = probe_duration(mp3) + (1.4 if last else 0.5)
+        if last and teaser:
+            dur = max(dur, 7.5)
         seg = work / f"seg{i}.mp4"
-        make_segment(still, mp3, dur, i, seg)
+        make_segment(stills[i], mp3, dur, i, seg)
         for w, s, e in words:
             all_words.append([w, s + offset, e + offset])
         segments.append(seg)
         offset += dur
-        log(f"bloc {i+1}: {dur:.1f}s")
+        log(f"scène {i+1}: {dur:.1f}s")
 
     concat = work / "list.txt"
     concat.write_text("".join(f"file '{s}'\n" for s in segments))
@@ -375,7 +450,7 @@ def main(payload_path, out_dir):
     run(["ffmpeg", "-y", "-i", str(joined), "-vf", f"ass={ass}{fontsdir}",
          "-c:v", "libx264", "-preset", "medium", "-crf", "21", "-pix_fmt", "yuv420p",
          "-profile:v", "high", "-r", str(FPS), "-c:a", "copy", "-movflags", "+faststart", str(video)])
-    run(["ffmpeg", "-y", "-ss", "1.5", "-i", str(video), "-frames:v", "1", "-q:v", "3",
+    run(["ffmpeg", "-y", "-ss", "2", "-i", str(video), "-frames:v", "1", "-q:v", "3",
          str(out / "cover.jpg")])
 
     source = (ep.get("source") or "").strip()
@@ -386,12 +461,13 @@ def main(payload_path, out_dir):
         desc += f"Demain : {teaser}\n"
     if source:
         desc += f"\nSources : {source}\n"
+    desc += "Illustrations : photo Wikimedia Commons + dessins générés par IA.\n"
     desc += f"\n{HASHTAGS}"
     (out / "description.txt").write_text(desc, encoding="utf-8")
 
     meta = {k: ep.get(k) for k in ("episode", "title", "next_episode", "next_period",
                                    "next_event", "source", "source_url")}
-    meta.update(duration=round(total, 1), images=image_urls, description=desc)
+    meta.update(duration=round(total, 1), images=images_info, description=desc)
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"OK {video} ({total:.1f}s)")
 

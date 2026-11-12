@@ -53,6 +53,8 @@ jobs:
           cat payload.json
 
       - name: Rendre la vidéo
+        env:
+          POLLINATIONS_TOKEN: ${{ secrets.POLLINATIONS_TOKEN }}
         run: python render.py payload.json out
 
       - name: Garder une copie (artefact)
