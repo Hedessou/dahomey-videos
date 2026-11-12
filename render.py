@@ -255,7 +255,7 @@ def cloudflare_image(full, path, seed):
     for attempt in range(3):
         try:
             r = requests.post(url, headers={"Authorization": f"Bearer {CF_TOKEN}"},
-                              json={"prompt": full[:2000], "steps": 6, "seed": seed}, timeout=120)
+                              json={"prompt": full[:2000], "steps": 6}, timeout=120)
             data = r.json()
             img = ((data.get("result") or {}).get("image")) if r.ok else None
             if img:
