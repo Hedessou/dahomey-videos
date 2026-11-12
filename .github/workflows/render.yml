@@ -1,0 +1,91 @@
+name: Rendu épisode Dahomey
+
+on:
+  # Déclenché par Make (scénario « Histoire du Bénin — série quotidienne »)
+  repository_dispatch:
+    types: [episode]
+  # Test à la main depuis l'onglet Actions
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "JSON de l'épisode (laisser vide = exemple Houegbadja)"
+        required: false
+      publier:
+        description: "Envoyer à Make pour publier sur TikTok/YouTube ?"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rendu-dahomey
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installer ffmpeg et polices
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core jq
+          mkdir -p fonts
+          curl -fsSL -o fonts/Anton-Regular.ttf \
+            https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf || rm -f fonts/Anton-Regular.ttf
+
+      - name: Installer les dépendances Python
+        run: pip install -q -r requirements.txt
+
+      - name: Lire l'épisode
+        env:
+          CLIENT_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+          INPUT_PAYLOAD: ${{ github.event.inputs.payload }}
+        run: |
+          python payload.py > payload.json
+          cat payload.json
+
+      - name: Rendre la vidéo
+        run: python render.py payload.json out
+
+      - name: Garder une copie (artefact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: episode-${{ github.run_id }}
+          path: out/
+          retention-days: 14
+
+      - name: Mettre la vidéo en ligne (release)
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EP=$(jq -r '.episode // "x"' out/meta.json | tr -cd '0-9A-Za-z-')
+          TAG="ep-${EP}-${{ github.run_id }}"
+          TITLE=$(jq -r '.title // "Episode"' out/meta.json)
+          gh release create "$TAG" out/video.mp4 out/cover.jpg \
+            --title "Ép. ${EP} — ${TITLE}" --notes-file out/description.txt
+          echo "url=https://github.com/${{ github.repository }}/releases/download/${TAG}/video.mp4" >> "$GITHUB_OUTPUT"
+          echo "cover=https://github.com/${{ github.repository }}/releases/download/${TAG}/cover.jpg" >> "$GITHUB_OUTPUT"
+
+      - name: Prévenir Make (publication TikTok + YouTube)
+        if: github.event_name == 'repository_dispatch' || github.event.inputs.publier == 'true'
+        env:
+          MAKE_WEBHOOK: ${{ secrets.MAKE_PUBLISH_WEBHOOK }}
+          VIDEO_URL: ${{ steps.rel.outputs.url }}
+          COVER_URL: ${{ steps.rel.outputs.cover }}
+        run: |
+          if [ -z "$MAKE_WEBHOOK" ]; then
+            echo "::error::Secret MAKE_PUBLISH_WEBHOOK manquant"; exit 1
+          fi
+          jq --arg v "$VIDEO_URL" --arg c "$COVER_URL" \
+            '. + {video_url: $v, cover_url: $c}' out/meta.json \
+          | curl -fsS --retry 3 -X POST -H 'Content-Type: application/json' --data @- "$MAKE_WEBHOOK"
+          echo "Make prévenu : $VIDEO_URL"
