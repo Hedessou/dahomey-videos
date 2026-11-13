@@ -330,8 +330,13 @@ class MotionComic:
     def page(self, sc, lt):
         img = self.bg.copy()
         active = None
+        d0 = ImageDraw.Draw(img)
         for p in sc.panels:
             if lt < p.reveal:
+                # contour de la case à venir (page de BD pas encore remplie)
+                x, y, w, h = p.rect
+                d0.rectangle((x, y, x + w, y + h), fill=(255, 250, 235, 70),
+                             outline=(60, 50, 40, 110), width=4)
                 continue
             active = p
             x, y, w, h = p.rect
