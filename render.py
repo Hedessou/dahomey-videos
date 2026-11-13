@@ -195,6 +195,8 @@ def align_punctuation(words, text):
 
 # ---------------------------------------------------------------- images
 def wikimedia_images(query, n=3):
+    if os.environ.get("OFFLINE"):
+        return []
     try:
         r = requests.get(
             "https://commons.wikimedia.org/w/api.php",
@@ -270,6 +272,10 @@ def cloudflare_image(full, path, seed):
 
 def comic_image(prompt, path, seed):
     """Case de BD : Cloudflare si configuré, sinon Pollinations (anonyme : filigrane possible)."""
+    if os.environ.get("OFFLINE"):
+        run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i",
+             f"mandelbrot=s=1024x1024:start_scale={1.5 + (seed % 7) * 0.3}", "-frames:v", "1", str(path)])
+        return path
     full = f"{prompt}. {COMIC_STYLE}"
     if CF_ACCOUNT and CF_TOKEN:
         got = cloudflare_image(full, path, seed)
@@ -512,5 +518,203 @@ def main(payload_path, out_dir):
     log(f"OK {video} ({total:.1f}s)")
 
 
+# ======================================================================
+#  Mode « motion comic » (par défaut)
+# ======================================================================
+def get_scenes_motion(ep):
+    """[(narration, [ {image_prompt, bubble, sfx}, ... ])] — 1 à 3 cases par scène."""
+    raw = ep.get("scenes")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            raw = None
+    out = []
+    if isinstance(raw, list):
+        for s in raw:
+            if not isinstance(s, dict):
+                continue
+            txt = (s.get("narration") or s.get("text") or "").strip()
+            if not txt:
+                continue
+            panels = []
+            for p in (s.get("panels") or [])[:3]:
+                if isinstance(p, dict):
+                    panels.append({
+                        "image_prompt": (p.get("image_prompt") or "").strip(),
+                        "bubble": (p.get("bubble") or "").strip()[:70] or None,
+                        "sfx": (p.get("sfx") or "").strip()[:12] or None,
+                    })
+                elif isinstance(p, str) and p.strip():
+                    panels.append({"image_prompt": p.strip(), "bubble": None, "sfx": None})
+            if not panels:
+                panels = [{"image_prompt": (s.get("image_prompt") or "").strip(),
+                           "bubble": None, "sfx": None}]
+            out.append((txt, panels))
+    if len(out) >= 2:
+        return out
+    return [(t, [{"image_prompt": ip, "bubble": None, "sfx": None}]) for t, ip in get_scenes(ep)]
+
+
+def caption_groups(words, max_words=6):
+    groups, chunk = [], []
+    for w in words:
+        chunk.append(w)
+        if len(chunk) >= max_words or re.search(r"[.,;:!?…]$", w[0]):
+            groups.append(chunk)
+            chunk = []
+    if chunk:
+        groups.append(chunk)
+    caps = []
+    for i, g in enumerate(groups):
+        start = g[0][1]
+        end = groups[i + 1][0][1] if i + 1 < len(groups) else g[-1][2] + 0.3
+        end = min(end, g[-1][2] + 0.6)
+        caps.append((start, end, " ".join(x[0] for x in g)))
+    return caps
+
+
+def main_motion(payload_path, out_dir):
+    from PIL import Image
+    import motion
+    import sound
+
+    ep = json.loads(Path(payload_path).read_text(encoding="utf-8"))
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix="motion_"))
+
+    title = (ep.get("title") or "Histoire du Dahomey").strip()
+    scenes = get_scenes_motion(ep)
+    episode = str(ep.get("episode") or ep.get("current_episode") or "").strip()
+    label = f"{SERIES_LABEL} · ÉP. {episode}" if episode else SERIES_LABEL
+    teaser = (ep.get("next_event") or "").strip()
+    seed = int(re.sub(r"\D", "", episode) or 7) * 101 + 7
+    log(f"épisode {episode} — {title} — {len(scenes)} scènes, "
+        f"{sum(len(p) for _, p in scenes)} cases (motion comic)")
+
+    # 1) voix et timings
+    voice_files, durs, words_all = [], [], []
+    for i, (text, _) in enumerate(scenes):
+        mp3 = work / f"voice{i}.mp3"
+        words = align_punctuation(tts(text, mp3), text)
+        last = i == len(scenes) - 1
+        d = probe_duration(mp3) + (1.6 if last else 0.7)
+        if last and teaser:
+            d = max(d, 8.0)
+        voice_files.append(mp3)
+        durs.append(d)
+        words_all.append(words)
+
+    # 2) images : scène 1 = photo du palais, ensuite cases de BD
+    used_urls, images_info = [], []
+    built, start = [], 0.0
+    whooshes, impacts = [], [0.55]
+    k = 0
+    for i, ((text, panels), d, words) in enumerate(zip(scenes, durs, words_all)):
+        if i == 0:
+            panels = panels[:1]
+        n = len(panels)
+        rects = motion.layout(n)
+        mp = []
+        for j, pinfo in enumerate(panels):
+            path = work / f"img{i}_{j}.jpg"
+            img = None
+            if i == 0:
+                img, u = wikimedia_file(PALACE_QUERIES, path)
+                if u:
+                    images_info.append({"scene": 1, "source": "wikimedia", "url": u})
+            else:
+                prompt = pinfo["image_prompt"] or text[:300]
+                img = comic_image(prompt, path, seed + k)
+                if img:
+                    images_info.append({"scene": i + 1, "panel": j + 1, "source": "cloudflare/pollinations",
+                                        "prompt": prompt})
+                else:
+                    img, u = wikimedia_file([ep.get("image_query"), *FALLBACK_QUERIES], path, skip=used_urls)
+                    if u:
+                        used_urls.append(u)
+            if not img:
+                img = placeholder(work / f"img{i}_{j}.png")
+            k += 1
+            # apparition calée sur la narration
+            if j == 0:
+                reveal = 0.15 if i else 0.0
+            else:
+                wi = min(len(words) - 1, (j * len(words)) // n) if words else 0
+                reveal = max(0.6 * j, (words[wi][1] if words else d * j / n) - 0.15)
+            pnl = motion.Panel(Image.open(img), rects[j], reveal, j,
+                               bubble=pinfo.get("bubble"), sfx=pinfo.get("sfx"))
+            mp.append(pnl)
+            whooshes.append(start + reveal)
+            if pnl.sfx is not None:
+                impacts.append(start + pnl.sfx_t)
+        kind = "embers" if i % 2 == 0 else "dust"
+        built.append(motion.Scene(start, d, mp, motion.Particles(seed + i, kind)))
+        if i:
+            whooshes.append(start)
+        start += d
+        log(f"scène {i+1}: {d:.1f}s, {n} case(s)")
+    total = start
+
+    # 3) sous-titres (récitatifs)
+    caps, off = [], 0.0
+    for words, d in zip(words_all, durs):
+        caps += [(s + off, e + off, t) for s, e, t in caption_groups(words)]
+        off += d
+
+    # 4) bande son : voix + musique (baissée sous la voix) + bruitages
+    concat = work / "voice_list.txt"
+    padded = []
+    for i, (vf, d) in enumerate(zip(voice_files, durs)):
+        pf = work / f"vpad{i}.wav"
+        run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(vf), "-af",
+             f"aresample=44100,apad,atrim=0:{d:.3f}", "-ac", "1", "-ar", "44100", str(pf)])
+        padded.append(pf)
+    concat.write_text("".join(f"file '{p}'\n" for p in padded))
+    voice = work / "voice.wav"
+    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(concat),
+         "-c", "pcm_s16le", str(voice)])
+    sound.write_wav(work / "music.wav", sound.music(total))
+    sound.write_wav(work / "sfx.wav", sound.sfx_track(total, whooshes, impacts))
+    mix = work / "mix.wav"
+    run(["ffmpeg", "-y", "-loglevel", "error",
+         "-i", str(voice), "-i", str(work / "music.wav"), "-i", str(work / "sfx.wav"),
+         "-filter_complex",
+         "[0:a]asplit=2[v][vk];"
+         "[1:a]volume=0.32[m];"
+         "[m][vk]sidechaincompress=threshold=0.03:ratio=8:attack=20:release=400[md];"
+         "[2:a]volume=0.55[s];"
+         "[v][md][s]amix=inputs=3:normalize=0:duration=first,loudnorm=I=-14:TP=-1.5:LRA=11[a]",
+         "-map", "[a]", "-ac", "2", "-ar", "44100", str(mix)])
+
+    # 5) images animées
+    comic = motion.MotionComic(built, caps, title, episode, label, teaser, total)
+    video = out / "video.mp4"
+    comic.render(video, mix)
+    run(["ffmpeg", "-y", "-loglevel", "error", "-ss", "1.2", "-i", str(video),
+         "-frames:v", "1", "-q:v", "3", str(out / "cover.jpg")])
+
+    source = (ep.get("source") or "").strip()
+    desc = f"{title}\n\n"
+    if episode:
+        desc += f"Épisode {episode} de notre série en BD sur l'histoire du royaume du Dahomey.\n"
+    if teaser:
+        desc += f"Demain : {teaser}\n"
+    if source:
+        desc += f"\nSources : {source}\n"
+    desc += "Illustrations : photo Wikimedia Commons + dessins générés par IA. Musique originale.\n"
+    desc += f"\n{HASHTAGS}"
+    (out / "description.txt").write_text(desc, encoding="utf-8")
+    meta = {k2: ep.get(k2) for k2 in ("episode", "title", "next_episode", "next_period",
+                                      "next_event", "source", "source_url")}
+    meta.update(duration=round(total, 1), images=images_info, description=desc)
+    (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    log(f"OK {video} ({total:.1f}s)")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "out")
+    if os.environ.get("RENDER_MODE", "motion") == "static":
+        main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "out")
+    else:
+        main_motion(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else "out")

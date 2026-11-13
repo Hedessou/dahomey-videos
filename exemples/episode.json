@@ -9,23 +9,65 @@
     },
     {
       "narration": "Selon la tradition orale, une famille princière quitte Allada, au sud, après une querelle de succession. Elle s'installe sur le plateau d'Abomey, une terre déjà occupée par d'autres chefs locaux.",
-      "image_prompt": "a royal procession of West African nobles and warriors leaving a town and walking north across a savanna plateau at dawn, carrying spears, parasols and baskets"
+      "panels": [
+        {
+          "image_prompt": "a royal procession of West African nobles leaving a coastal town at dawn, carrying spears, parasols and baskets, wide shot"
+        },
+        {
+          "image_prompt": "close-up of an elder prince looking north toward a red laterite plateau, worried expression",
+          "bubble": "Partons vers le nord !"
+        }
+      ]
     },
     {
       "narration": "Vers le milieu du XVIIe siècle, un chef de cette famille s'impose : Houegbadja. Les historiens situent son règne vers 1645 à 1685, mais ces dates restent approximatives.",
-      "image_prompt": "a dignified 17th century Fon king seated on a carved wooden throne under a large ceremonial parasol, surrounded by advisers, inside a red earth courtyard"
+      "panels": [
+        {
+          "image_prompt": "a dignified 17th century Fon king seated on a carved wooden throne under a large ceremonial parasol, medium shot"
+        },
+        {
+          "image_prompt": "advisers kneeling before the king in a red earth courtyard, low angle"
+        },
+        {
+          "image_prompt": "close-up of the king's hand holding a carved royal staff (recade)"
+        }
+      ]
     },
     {
       "narration": "La tradition raconte qu'il bâtit son palais sur les terres d'un chef appelé Dan. De là viendrait le nom Danhomè, « dans le ventre de Dan ». C'est une légende, transmise de génération en génération.",
-      "image_prompt": "builders constructing a large palace with red clay walls and thatched roofs, workers carrying earth in baskets, a king watching from a distance"
+      "panels": [
+        {
+          "image_prompt": "builders raising red clay palace walls with thatched roofs, workers carrying earth in baskets, wide shot",
+          "sfx": "TOC TOC"
+        },
+        {
+          "image_prompt": "a chief named Dan standing proudly before his compound, dramatic sky"
+        }
+      ]
     },
     {
       "narration": "Houegbadja organise le pouvoir : des ministres, des règles de succession et des cérémonies royales. Son emblème est un poisson et une nasse, le symbole d'un roi que nul ne peut piéger.",
-      "image_prompt": "a royal ceremony in an African palace courtyard, ministers in white cloth kneeling before the king, a large embroidered banner showing a fish and a fishing trap"
+      "panels": [
+        {
+          "image_prompt": "royal ceremony in a palace courtyard, ministers in white cloth kneeling before the king, drums playing",
+          "sfx": "TAM TAM"
+        },
+        {
+          "image_prompt": "close-up of an embroidered royal banner showing a fish and a fishing trap"
+        }
+      ]
     },
     {
       "narration": "À sa mort, le royaume est encore petit. Mais les bases sont posées. Son successeur, Akaba, va commencer à l'agrandir. Ce sera notre prochain épisode. Abonne-toi pour ne pas le rater.",
-      "image_prompt": "a young African prince standing on a hill at sunset looking over a vast green landscape with villages, holding a royal staff, determined expression"
+      "panels": [
+        {
+          "image_prompt": "an old king lying in state surrounded by mourners with torches, night"
+        },
+        {
+          "image_prompt": "a young prince standing on a hill at sunset looking over a vast landscape, holding a royal staff",
+          "bubble": "Le royaume va grandir."
+        }
+      ]
     }
   ],
   "image_query": "Royal Palaces of Abomey",
