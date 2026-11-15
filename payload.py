@@ -7,6 +7,38 @@ import sys
 from pathlib import Path
 
 
+def repair_json(text, rounds=6):
+    """Répare les petites erreurs de crochets/accolades de l'IA (inversion, oubli, en trop)."""
+    for _ in range(rounds):
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError as e:
+            pos = e.pos
+        fixed = None
+        lo, hi = max(0, pos - 16), min(len(text), pos + 3)
+        cands = []
+        for i in range(lo, hi):
+            c = text[i]
+            if c in "]}":
+                cands.append(text[:i] + ("}" if c == "]" else "]") + text[i + 1:])
+                cands.append(text[:i] + text[i + 1:])
+                if i + 1 < len(text) and text[i + 1] in "]}" and text[i + 1] != c:
+                    cands.append(text[:i] + text[i + 1] + c + text[i + 2:])
+            for ins in "]}":
+                cands.append(text[:i] + ins + text[i:])
+        best = None
+        for c in cands:
+            try:
+                return json.loads(c, strict=False)
+            except json.JSONDecodeError as e2:
+                if best is None or e2.pos > best[0]:
+                    best = (e2.pos, c)
+        if best is None or best[0] <= pos:
+            break
+        text = best[1]
+    raise json.JSONDecodeError("irréparable", text, 0)
+
+
 def loads_loose(text):
     """Accepte du JSON entouré de ```json … ```, de texte parasite, de virgules en trop."""
     if isinstance(text, dict):
@@ -22,6 +54,11 @@ def loads_loose(text):
                 return json.loads(fix, strict=False)
             except json.JSONDecodeError:
                 pass
+    for c in cands:
+        try:
+            return repair_json(c)
+        except json.JSONDecodeError:
+            pass
     sys.stderr.write("JSON illisible :\n" + text[:3000] + "\n")
     return {}
 
